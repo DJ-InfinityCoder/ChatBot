@@ -1,65 +1,226 @@
-import Image from "next/image";
+"use client";
+
+import { useState, useRef, useEffect } from "react";
+import { Message, ChatSession } from "@/types/chat";
+import Header from "@/components/Header";
+import ChatWindow from "@/components/ChatWindow";
+import ChatInput from "@/components/ChatInput";
+import { v4 as uuidv4 } from "uuid";
 
 export default function Home() {
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [sessionFile, setSessionFile] = useState<{ name: string; type: string; content: string } | null>(null);
+  const [inputValue, setInputValue] = useState("");
+  const retryCount = useRef(0);
+
+  const handleNewChat = () => {
+    setMessages([]);
+    setSessionFile(null);
+    setInputValue("");
+    retryCount.current = 0;
+  };
+
+  const handleSuggestionClick = (text: string) => {
+    if (text === "Analyze PDF") {
+      setInputValue("Can you analyze this PDF for me?");
+    } else if (text === "Analyze Image") {
+      setInputValue("What can you tell me about this image?");
+    } else {
+      setInputValue("Help me draft some content about ");
+    }
+  };
+
+  const handleSendMessage = async (text: string, file?: File, isRetry = false) => {
+    if (!text?.trim() && !file) return;
+    if (!isRetry) retryCount.current = 0;
+    
+    const userMessageId = uuidv4();
+    const assistantMessageId = uuidv4();
+    const timestamp = Date.now();
+    
+    // 1. ADD MESSAGES IMMEDIATELY FOR ZERO LATENCY UI
+    if (!isRetry) {
+      const newUserMessage: Message = {
+        id: userMessageId,
+        role: "user",
+        content: text,
+        timestamp,
+        file: file ? { 
+          name: file.name, 
+          type: file.type,
+          // Temporary local preview if image
+          data: file.type.startsWith("image/") ? URL.createObjectURL(file) : undefined
+        } : undefined,
+      };
+
+      const thinkingMessage: Message = {
+        id: assistantMessageId,
+        role: "assistant",
+        content: "",
+        timestamp: timestamp + 1,
+        isGenerating: true,
+      };
+
+      setMessages((prev) => [...prev, newUserMessage, thinkingMessage]);
+    } else {
+      // For retry, just reset the generating state of the last message or add a new one
+      const thinkingMessage: Message = {
+        id: assistantMessageId,
+        role: "assistant",
+        content: "",
+        timestamp: Date.now(),
+        isGenerating: true,
+      };
+      setMessages((prev) => [...prev, thinkingMessage]);
+    }
+
+    setIsLoading(true);
+    let currentFile = sessionFile;
+
+    try {
+      // 2. HANDLE FILE UPLOAD IN BACKGROUND
+      if (file && !isRetry) {
+        try {
+          const formData = new FormData();
+          formData.append("file", file);
+          
+          const uploadRes = await fetch("/api/upload", {
+            method: "POST",
+            body: formData,
+          });
+          
+          if (!uploadRes.ok) throw new Error("Upload failed");
+          
+          const uploadData = await uploadRes.json();
+          currentFile = {
+            name: uploadData.name,
+            type: uploadData.type,
+            content: uploadData.content,
+          };
+          setSessionFile(currentFile);
+
+          // Update user message with real base64 data for persistence
+          if (file.type.startsWith("image/")) {
+            setMessages(prev => prev.map(m => 
+              m.id === userMessageId 
+                ? { ...m, file: { ...m.file!, data: uploadData.content } } 
+                : m
+            ));
+          }
+        } catch (error) {
+          console.error("Upload error:", error);
+        }
+      }
+
+      // 3. START CHAT REQUEST
+      const chatMessages = messages.filter(m => !m.isGenerating);
+      const response = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          messages: isRetry ? chatMessages : [...chatMessages, { id: userMessageId, role: "user", content: text, timestamp }],
+          fileContent: currentFile?.content,
+          fileType: currentFile?.type,
+        }),
+      });
+
+      if (!response.ok) {
+        if (response.status === 503 && retryCount.current < 2) {
+          retryCount.current++;
+          // Remove the thinking message before retrying to avoid duplicates
+          setMessages(prev => prev.filter(m => m.id !== assistantMessageId));
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          return handleSendMessage(text, undefined, true);
+        }
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData.error || "Chat failed");
+      }
+
+      const reader = response.body?.getReader();
+      const decoder = new TextDecoder();
+      
+      let fullText = "";
+      let displayedText = "";
+      let isStreaming = true;
+
+      const drain = () => {
+        if (displayedText.length < fullText.length) {
+          const diff = fullText.length - displayedText.length;
+          const increment = diff > 50 ? 5 : diff > 20 ? 3 : 1;
+          
+          displayedText += fullText.slice(displayedText.length, displayedText.length + increment);
+          
+          setMessages((prev) => 
+            prev.map((msg) => 
+              msg.id === assistantMessageId 
+                ? { ...msg, content: displayedText } 
+                : msg
+            )
+          );
+        }
+
+        if (isStreaming || displayedText.length < fullText.length) {
+          requestAnimationFrame(drain);
+        } else {
+          if (!fullText.trim()) {
+            setMessages((prev) => 
+              prev.map((msg) => 
+                msg.id === assistantMessageId 
+                  ? { ...msg, content: "The AI returned an empty response. Please try again.", isGenerating: false } 
+                  : msg
+              )
+            );
+          } else {
+            setMessages((prev) => 
+              prev.map((msg) => 
+                msg.id === assistantMessageId 
+                  ? { ...msg, isGenerating: false } 
+                  : msg
+              )
+            );
+          }
+        }
+      };
+
+      requestAnimationFrame(drain);
+
+      while (true) {
+        const { done, value } = await reader!.read();
+        if (done) break;
+        const chunk = decoder.decode(value);
+        fullText += chunk;
+      }
+      isStreaming = false;
+
+    } catch (error: any) {
+      console.error("Chat error:", error);
+      const errorMessage = error.message.includes("503") 
+        ? "The AI is currently busy. Please try again in a moment."
+        : "Oops! Something went wrong. Please try again.";
+      
+      setMessages((prev) => 
+        prev.map(m => m.id === assistantMessageId ? { ...m, content: errorMessage, isGenerating: false } : m)
+      );
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
-      </main>
-    </div>
+    <main className="relative flex h-screen flex-col bg-background text-foreground transition-colors overflow-hidden">
+      <div className="bg-mesh" />
+      <Header onNewChat={handleNewChat} />
+      <ChatWindow 
+        messages={messages} 
+        onSuggestionClick={handleSuggestionClick} 
+      />
+      <ChatInput 
+        onSendMessage={handleSendMessage} 
+        isLoading={isLoading} 
+        inputValue={inputValue}
+        setInputValue={setInputValue}
+      />
+    </main>
   );
 }
